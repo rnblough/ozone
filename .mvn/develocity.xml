@@ -23,10 +23,6 @@
         xmlns="https://www.gradle.com/develocity-maven" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
         xsi:schemaLocation="https://www.gradle.com/develocity-maven https://www.gradle.com/schema/develocity-maven.xsd">
   <projectId>ozone</projectId>
-  <server>
-    <url>https://develocity.apache.org</url>
-    <allowUntrusted>false</allowUntrusted>
-  </server>
   <buildScan>
     <capture>
       <fileFingerprints>true</fileFingerprints>
@@ -34,8 +30,12 @@
       <testLogging>true</testLogging>
     </capture>
     <backgroundBuildScanUpload>#{isFalse(env['GITHUB_ACTIONS'])}</backgroundBuildScanUpload>
+    <termsOfUse>
+      <url>https://gradle.com/help/legal-terms-of-use</url>
+      <accept>true</accept>
+    </termsOfUse>
     <publishing>
-      <onlyIf><![CDATA[authenticated]]></onlyIf>
+      <onlyIf><![CDATA[env['GITHUB_ACTIONS'] == 'true' and (env['GITHUB_REF_NAME'] == 'maven-optimizations-project' or env['GITHUB_HEAD_REF'] == 'maven-optimizations-project')]]></onlyIf>
     </publishing>
     <obfuscation>
       <ipAddresses>#{{'0.0.0.0'}}</ipAddresses>
