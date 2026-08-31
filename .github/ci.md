@@ -9,8 +9,61 @@ Every factual claim below is annotated with the file (and line, where useful) th
 - The entry point for both push and pull-request events is [`post-commit.yml`](./workflows/post-commit.yml), whose workflow name is `build-branch`.  Its single job invokes [`ci.yml`](./workflows/ci.yml) (workflow name `full-ci`) via `workflow_call`.
 - Cross-job cancellation for a given PR (or non-`apache/ozone` push) is handled by the `concurrency:` block in [`post-commit.yml`](./workflows/post-commit.yml) lines 20-22.  There is no separate "Cancelling" workflow.
 - The default JDK for build and test steps is set by `TEST_JAVA_VERSION: 21` in [`ci.yml`](./workflows/ci.yml) line 43, and duplicated in [`populate-cache.yml`](./workflows/populate-cache.yml) line 39.  It matches the JDK bundled in the [`ghcr.io/apache/ozone-runner`](./workflows/check.yml) image.
-- All matrix jobs use `fail-fast: false` ([`ci.yml`](./workflows/ci.yml) lines 181, 215, 306, 351).  A failure in one matrix leg does not cancel its siblings.
+- All matrix jobs use `fail-fast: false` ([`ci.yml`](./workflows/ci.yml) lines 181, 215, 306, 352).  A failure in one matrix leg does not cancel its siblings.
 - Nearly every `ci.yml` job delegates its work to the reusable [`check.yml`](./workflows/check.yml) harness, which handles checkout, cache restore, Java setup, script execution, and artifact upload.  Only `coverage`, `generate-config-doc`, and `update-ozone-site-config-doc` don't use it.
+
+## Parallelism
+
+The CI pipeline layers several parallelism mechanisms, some effective and some dormant.  The status of each is called out below so that a future reader can tell working knobs from ones that have been added, disabled, or never activated.
+
+### Job-level fanout (working)
+
+- The `concurrency:` group in [`post-commit.yml`](./workflows/post-commit.yml) lines 20-22 cancels superseded runs for PRs and non-`apache/ozone` pushes.
+- Four matrices in [`ci.yml`](./workflows/ci.yml) run their legs concurrently, all with `fail-fast: false`:
+  - `compile` (lines 174-181): Java **8**, **11**, **17** on `ubuntu-24.04` plus Java **21** on `macos-15`.
+  - `basic` (lines 212-215): one leg per basic check selected by `build-info`.
+  - `acceptance` (lines 303-306): one leg per suite from [`acceptance_suites.sh`](../dev-support/ci/acceptance_suites.sh).
+  - `integration` (lines 349-352): one leg per profile from [`integration_suites.sh`](../dev-support/ci/integration_suites.sh) (`client`, `container`, `filesystem`, `flaky`, `hdds`, `om`, `ozone`, `recon`, `snapshot`).
+- Every matrix leg is dispatched through [`check.yml`](./workflows/check.yml).  The `split` input (lines 114-118) is used **only** to disambiguate the job display name (line 150) and the uploaded artifact name (line 272) — it is not forwarded to the check script as an env var.  Work division for the four `ci.yml` matrices happens through `script-args` (e.g. `-Ptest-${{ matrix.profile }}` at line 344), not through `split`.
+- [`intermittent-test-check.yml`](./workflows/intermittent-test-check.yml) (lines 88-94, 160-162) and [`repeat-acceptance.yml`](./workflows/repeat-acceptance.yml) (lines 72-78, 133-135) construct a `[1..N]` split matrix, but each leg runs **the same test class or suite** — splits are concurrent replicas for flakiness detection, not a work-division scheme.  In `intermittent-test-check.yml`, the total number of executions is `splits × iterations`, where `iterations` drives the sequential `ITERATIONS` loop inside [`junit.sh`](../hadoop-ozone/dev-support/checks/junit.sh) (lines 28, 68).
+
+### Maven reactor parallelism (`-T 1C`)
+
+`-T 1C` runs one Maven builder thread per available core across the *reactor* — it parallelizes module builds, not Surefire forks within a single module.  It was added recently to nearly every check script.  For per-module goals it works; for aggregator goals that execute once at the reactor root it is a no-op.
+
+| Script | Line | Goal | Effective? |
+|---|---|---|---|
+| [`_build.sh`](../hadoop-ozone/dev-support/checks/_build.sh) | 30 | full build lifecycle (used by `build.sh`, `compile.sh`, `repro.sh`) | Yes |
+| [`checkstyle.sh`](../hadoop-ozone/dev-support/checks/checkstyle.sh) | 27 | `checkstyle:check` | Yes |
+| [`pmd.sh`](../hadoop-ozone/dev-support/checks/pmd.sh) | 29 | `pmd:check` | Yes |
+| [`findbugs.sh`](../hadoop-ozone/dev-support/checks/findbugs.sh) | 33 | `spotbugs:check` | Yes |
+| [`rat.sh`](../hadoop-ozone/dev-support/checks/rat.sh) | 27 | `apache-rat-plugin:check` | Yes |
+| [`javadoc.sh`](../hadoop-ozone/dev-support/checks/javadoc.sh) | 26 | `javadoc:aggregate` | **No** — aggregator goal runs once at the reactor root; `-T` cannot split it |
+| [`license.sh`](../hadoop-ozone/dev-support/checks/license.sh) | 45 | `license:aggregate-add-third-party` | **No** — same reason as `javadoc:aggregate` |
+| [`junit.sh`](../hadoop-ozone/dev-support/checks/junit.sh) | 38 | `verify` (used by the `integration` job via [`integration.sh`](../hadoop-ozone/dev-support/checks/integration.sh)) | Runs, but with a caveat — see below |
+| [`populate-cache.yml`](./workflows/populate-cache.yml) | 38, 100 | `-Pgo-offline clean verify` and Java 8 `test-compile` | Yes |
+
+The `-T 1C` on `junit.sh` runs multiple modules' Surefire executions concurrently, one per builder thread.  Because the CI `integration` job does not restrict the reactor (`ci.yml` line 344 passes only `-Ptest-<profile> -Drocks_tools_native`), several modules can execute Surefire in parallel.  Each individual Surefire still uses the default `forkCount=1` because the [`parallel-tests` profile](#dormant-knobs) that would apply per-fork isolation is not activated.  `MiniOzoneCluster` (which binds fixed default ports and shares `test.build.data` when isolation is off) can therefore run in more than one JVM at once with no coordination.  The flag is not broken — Maven does start parallel builders — but the isolation contract that would make cluster-based tests safe under it is not in effect.
+
+### Surefire and JVM knobs (working)
+
+These apply to every test run, whether or not any `-T` flag is present.
+
+| Knob | Location | Effect |
+|---|---|---|
+| `reuseForks=false` | [`pom.xml`](../pom.xml) line 2373 | Each test class runs in a fresh JVM. |
+| `forkedProcessTimeoutInSeconds=${surefire.fork.timeout}` (default `1200`s) | [`pom.xml`](../pom.xml) lines 2374, 213 | Kills stuck forks. |
+| `-Xmx8192m -XX:+HeapDumpOnOutOfMemoryError` | [`pom.xml`](../pom.xml) line 150 | Per-fork heap ceiling, injected into `argLine`. |
+| `MALLOC_ARENA_MAX=4` | [`pom.xml`](../pom.xml) line 2379 | Caps glibc arenas to reduce RSS across parallel forks. |
+| `surefire.rerunFailingTestsCount=5` + `surefire.fork.timeout=3600` | [`integration.sh`](../hadoop-ozone/dev-support/checks/integration.sh) lines 22-23 | Auto-injected only when `-Ptest-flaky` is in the args. |
+
+The [`test-flaky` profile](../pom.xml) (line 2888) is one of the profiles emitted by `integration_suites.sh`, so the `flaky` matrix leg is what enables both reruns and the 60-minute per-fork timeout.
+
+### Dormant knobs
+
+- **`parallel-tests` Maven profile** — defined in [`hadoop-hdds/pom.xml`](../hadoop-hdds/pom.xml) lines 94-138 and [`hadoop-ozone/pom.xml`](../hadoop-ozone/pom.xml) lines 140-185.  Would set `forkCount=${testsThreadCount}`, `reuseForks=false`, per-fork `test.build.data` / `hadoop.tmp.dir` / `test.unique.fork.id` system properties, and wire in the `parallel-tests-createdir` goal.  Nothing under [`.github/workflows`](./workflows) or [`hadoop-ozone/dev-support/checks/`](../hadoop-ozone/dev-support/checks) activates it.  The `testsThreadCount` property ([`pom.xml`](../pom.xml) line 218, default 4), the per-fork sysprops, and the `-DminiClusterDedicatedDirs=true` flag inside the profile are therefore unused as CI is configured.
+- **JUnit 5 parallel execution** — [`pom.xml`](../pom.xml) lines 2400-2404 set `junit.jupiter.execution.parallel.enabled = true`, but the default execution mode is `same_thread`, so tests only run concurrently if they opt in via `@Execution(CONCURRENT)`.  A repo-wide grep for `@Execution(` and `@Isolated` finds two annotated files (`TestDiskCheckUtil`, `TestOmSnapshotManagerConfig`), so in practice this engine is doing no meaningful concurrency.
+- **`check.yml`'s `split` input as a work-division parameter** — the input exists (lines 114-118) but is never passed into the check script.  Work division for `acceptance` and `integration` happens through `script-args`, not through `split`.
 
 ## Workflows
 
