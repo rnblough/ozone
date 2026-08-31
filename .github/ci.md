@@ -65,6 +65,59 @@ The [`test-flaky` profile](../pom.xml) (line 2888) is one of the profiles emitte
 - **JUnit 5 parallel execution** — [`pom.xml`](../pom.xml) lines 2400-2404 set `junit.jupiter.execution.parallel.enabled = true`, but the default execution mode is `same_thread`, so tests only run concurrently if they opt in via `@Execution(CONCURRENT)`.  A repo-wide grep for `@Execution(` and `@Isolated` finds two annotated files (`TestDiskCheckUtil`, `TestOmSnapshotManagerConfig`), so in practice this engine is doing no meaningful concurrency.
 - **`check.yml`'s `split` input as a work-division parameter** — the input exists (lines 114-118) but is never passed into the check script.  Work division for `acceptance` and `integration` happens through `script-args`, not through `split`.
 
+## Caching and resource re-use
+
+The CI pipeline shares work across jobs and runs through four channels: the GitHub Actions cache service (Maven repo, pnpm store, NodeJS bootstrap, Java distributions), GitHub Actions artifacts (`ozone-bin`, `ozone-src`, `ozone-repo`, `ratis-jars`), Develocity (build scans only — see below), and container images pulled from GHCR.  As with Parallelism, several mechanisms are working, one is deliberately branch-gated, and a few carry small dead spots worth calling out.
+
+### Cache lookups (working)
+
+| Cache | Producer | Consumers | Key | Path |
+|---|---|---|---|---|
+| Maven dependency cache | [`populate-cache.yml`](./workflows/populate-cache.yml) lines 110-117 (`actions/cache/save`); trigger lines 21-32; populated by `mvn -Pgo-offline clean verify` at Java 21 (line 89) and `mvn -Pgo-offline -DskipRecon -DskipShade test-compile` at Java 8 (line 100); Ozone jars deleted before save (line 104) | Restore-only: [`check.yml`](./workflows/check.yml) lines 183-192 (default via `needs-maven-cache`), [`ci.yml`](./workflows/ci.yml) lines 369-377 (inline `coverage`), [`intermittent-test-check.yml`](./workflows/intermittent-test-check.yml) lines 114-122 and 168-176, [`repeat-acceptance.yml`](./workflows/repeat-acceptance.yml) lines 99-108 | `maven-repo-${{ hashFiles('**/pom.xml') }}`, restore-keys `maven-repo-` | `~/.m2/repository/*/*/*` with `!~/.m2/repository/org/apache/ozone` |
+| pnpm store | [`check.yml`](./workflows/check.yml) lines 173-181 (full `actions/cache`, gated by `needs-npm-cache`); populated by `pnpm install --frozen-lockfile` invoked from `hadoop-ozone/recon/pom.xml` during `build`. Only [`ci.yml`](./workflows/ci.yml) line 131 sets `needs-npm-cache: true`. | Same step is both save and restore; also restored by [`repeat-acceptance.yml`](./workflows/repeat-acceptance.yml) lines 90-98 | `${{ runner.os }}-pnpm-${{ hashFiles('**/pnpm-lock.yaml') }}` | `~/.pnpm-store` |
+| NodeJS bootstrap | [`populate-cache.yml`](./workflows/populate-cache.yml) lines 73-85, downloaded by [`dev-support/ci/download-nodejs.sh`](../dev-support/ci/download-nodejs.sh) | Only [`populate-cache.yml`](./workflows/populate-cache.yml) itself — downstream consumers pick up the same path via the main Maven-repo cache | `nodejs-${{ steps.nodejs-version.outputs.nodejs-version }}` | `~/.m2/repository/com/github/eirslett/node` |
+| Java distributions | `actions/setup-java@v5` implicit cache | [`check.yml`](./workflows/check.yml) lines 224-229, [`populate-cache.yml`](./workflows/populate-cache.yml) lines 63-66 and 93-96, [`ci.yml`](./workflows/ci.yml) line 387, [`repeat-acceptance.yml`](./workflows/repeat-acceptance.yml) line 110, [`intermittent-test-check.yml`](./workflows/intermittent-test-check.yml) line 192, [`build-ratis.yml`](./workflows/build-ratis.yml) lines 84-88 | Managed by `setup-java` | Toolcache |
+| Ratis dependencies | [`build-ratis.yml`](./workflows/build-ratis.yml) lines 77-83 (full `actions/cache`) | Same job only.  Scoped to the *Ratis* checkout's `**/pom.xml`, so it only pays off when re-building the same Ratis ref — see [Dormant / low-yield](#dormant--low-yield). | `ratis-dependencies-${{ hashFiles('**/pom.xml') }}` | `~/.m2/repository` with `!~/.m2/repository/org/apache/ratis` |
+
+Consumers of the Maven-repo cache deliberately use `actions/cache/restore@` rather than `actions/cache@`: [`populate-cache.yml`](./workflows/populate-cache.yml) is the sole producer, and every other workflow is read-only.  This is why a run against a `pom.xml` change may miss cache until the next `populate-cache` run — the daily cron at [`scheduled-cache-update.yml`](./workflows/scheduled-cache-update.yml) line 22 (`20 3 * * *`) and the pom-change push trigger ([`populate-cache.yml`](./workflows/populate-cache.yml) lines 21-30) are the two paths that refresh it.
+
+### Build artifacts (working)
+
+All four are uploaded with `retention-days: 1`.
+
+| Artifact | Producer | Consumers | `check.yml` gate flag |
+|---|---|---|---|
+| `ozone-bin` (Ozone binary tarball) | [`check.yml`](./workflows/check.yml) lines 279-287 (when `inputs.script == 'build'`); also [`repeat-acceptance.yml`](./workflows/repeat-acceptance.yml) lines 118-125 | [`check.yml`](./workflows/check.yml) lines 211-222 (extracts to `hadoop-ozone/dist/target`); wired in [`ci.yml`](./workflows/ci.yml) for `dependency` (line 226), `acceptance` (line 295), `kubernetes` (line 320); also [`generate-config-doc.yml`](./workflows/generate-config-doc.yml) lines 41-50; `coverage` downloads all artifacts and untars this one ([`ci.yml`](./workflows/ci.yml) lines 378-385) | `needs-ozone-binary-tarball` |
+| `ozone-src` (Ozone source tarball) | [`check.yml`](./workflows/check.yml) lines 289-296 | [`check.yml`](./workflows/check.yml) lines 162-171 (extracts to workspace root, replaces checkout); wired in [`ci.yml`](./workflows/ci.yml) for `compile` (line 185) | `needs-ozone-source-tarball` |
+| `ozone-repo` (Ozone-built Maven jars) | [`check.yml`](./workflows/check.yml) lines 298-305; also [`intermittent-test-check.yml`](./workflows/intermittent-test-check.yml) lines 144-150 in the build phase | [`check.yml`](./workflows/check.yml) lines 194-201 (extracts to `~/.m2/repository/org/apache/ozone`); wired in [`ci.yml`](./workflows/ci.yml) for `license` (line 240), `javadoc` (line 256), `repro` (line 273), `integration` (line 340); [`intermittent-test-check.yml`](./workflows/intermittent-test-check.yml) lines 184-191 downloads with `continue-on-error: true` | `needs-ozone-repo` |
+| `ratis-jars` (custom Ratis Maven jars) | [`build-ratis.yml`](./workflows/build-ratis.yml) lines 103-109; only produced when running [`ci-with-ratis.yml`](./workflows/ci-with-ratis.yml) or [`intermittent-test-check.yml`](./workflows/intermittent-test-check.yml) with a Ratis ref | [`check.yml`](./workflows/check.yml) lines 203-209 (gated on `inputs.ratis-args != ''`); [`intermittent-test-check.yml`](./workflows/intermittent-test-check.yml) lines 123-129 and 177-183 (gated on `inputs.ratis-ref`) | Implicit — download key is the `ratis-args` input, not a `needs-*` boolean |
+
+### `OZONE_REPO_CACHED` signal (working, narrow scope)
+
+[`junit.sh`](../hadoop-ozone/dev-support/checks/junit.sh) line 30 defaults `OZONE_REPO_CACHED=false`; at line 59, when `ITERATIONS > 1` and the flag is still `false`, the script runs a preparatory `mvn -DskipTests install` so that per-iteration test runs don't repeatedly rebuild sibling modules.  Only [`intermittent-test-check.yml`](./workflows/intermittent-test-check.yml) line 200 exports the flag as `true`, and only when the `ozone-repo` artifact was actually downloaded (the download at lines 184-191 is `continue-on-error: true`).  Nothing else in the pipeline drives iteration counts through `junit.sh`, so this signal never fires from the main `ci.yml` graph — that is intentional, not broken.
+
+### Develocity build scans (branch-gated, scans-only)
+
+The Develocity Maven extension is loaded unconditionally through [`.mvn/extensions.xml`](../.mvn/extensions.xml) lines 24-33 (`develocity-maven-extension` 1.22.2 + `common-custom-user-data-maven-extension` 2.2.0).  [`.mvn/develocity.xml`](../.mvn/develocity.xml) then narrows what actually happens:
+
+- Line 38 restricts scan **publishing** to `scans.gradle.com` to runs where `GITHUB_REF_NAME` or `GITHUB_HEAD_REF` is `maven-optimizations-project`.  Every other branch captures a scan and drops it.
+- Lines 44-47 enable the **local** build cache only when `GITHUB_ACTIONS` is unset — i.e. developer machines only.  Inside CI it is off.
+- Lines 48-50 disable the **remote** build cache entirely.
+
+`DEVELOCITY_ACCESS_KEY` is threaded through the pipeline ([`post-commit.yml`](./workflows/post-commit.yml) line 32 → [`ci.yml`](./workflows/ci.yml) line 30 → every job's `env:` block, e.g. [`ci.yml`](./workflows/ci.yml) lines 139, 195, 211, 223, 237, 253, 270, 292, 318, 337, 399; [`check.yml`](./workflows/check.yml) line 243).  Because remote build cache is disabled, that credential is **scan publishing only** — not a build-cache credential.  On any branch other than `maven-optimizations-project` the key is passed but not used.
+
+### Container images
+
+[`check.yml`](./workflows/check.yml) lines 138-142 defines `HADOOP_IMAGE`, `OZONE_IMAGE`, and `OZONE_RUNNER_IMAGE` (all `ghcr.io/apache/…`).  Images are pulled from GHCR at test time; caching is delegated to the runner's Docker daemon — there is no GHA cache entry for images.
+
+### Dormant / low-yield
+
+- **`workflow_call:` on [`populate-cache.yml`](./workflows/populate-cache.yml)** (line 31) — declared but no other workflow currently invokes it.  Harmless but unused.
+- **Java-version suffix in [`repeat-acceptance.yml`](./workflows/repeat-acceptance.yml)'s Maven cache key** (line 105: `maven-repo-${{ hashFiles('**/pom.xml') }}-${{ env.JAVA_VERSION }}`) — the step is `actions/cache/restore@` (line 100), so the suffixed key is never *saved* anywhere; the lookup always falls through to the plain `maven-repo-${{ hashFiles('**/pom.xml') }}` restore-key populated by `populate-cache.yml`.  The `-${JAVA_VERSION}` suffix is dead as configured.
+- **`node_modules` not cached in [`check.yml`](./workflows/check.yml)** — line 177 caches only `~/.pnpm-store`, whereas [`repeat-acceptance.yml`](./workflows/repeat-acceptance.yml) lines 93-95 cache both `~/.pnpm-store` and `**/node_modules`.  Not broken; `pnpm install --frozen-lockfile` still relinks from the store, so this leaves a small speedup on the table.
+- **Ratis dependencies cache** ([`build-ratis.yml`](./workflows/build-ratis.yml) lines 77-83) — full `actions/cache@`, so both restore and save.  Keyed on the *Ratis* checkout's `**/pom.xml`, so it only helps when re-building the same Ratis ref+pom; that path is rare in practice.
+- **`parallel-tests` Maven profile and the `check.yml` `split` input as work-division** — already documented under [Dormant knobs](#dormant-knobs) in the Parallelism section.  Both remain unused; noted here so the caching/artifact story doesn't imply otherwise.
+
 ## Workflows
 
 ### build-branch ([post-commit.yml](./workflows/post-commit.yml))
