@@ -7,10 +7,98 @@ Every factual claim below is annotated with the file (and line, where useful) th
 ## Overview
 
 - The entry point for both push and pull-request events is [`post-commit.yml`](./workflows/post-commit.yml), whose workflow name is `build-branch`.  Its single job invokes [`ci.yml`](./workflows/ci.yml) (workflow name `full-ci`) via `workflow_call`.
-- Cross-job cancellation for a given PR (or non-`apache/ozone` push) is handled by the `concurrency:` block in [`post-commit.yml`](./workflows/post-commit.yml) lines 20-22.  There is no separate "Cancelling" workflow.
+- Cross-job cancellation is handled by the `concurrency:` block in [`post-commit.yml`](./workflows/post-commit.yml) lines 20-22.  The intent — from `HDDS-12999` — is per-PR groups for pull requests, per-SHA groups for pushes to `apache/ozone` (no cancellation between commits), and per-branch groups for pushes to forks (cancel superseded runs on the same branch).  The line-21 group key uses a `case(...)` expression that is not part of GitHub Actions' documented expression syntax, so the observed runtime behavior of the key is not derivable from reading the workflow alone; see [Scope of work → Dormant / partial knobs](#dormant--partial-knobs) below.  There is no separate "Cancelling" workflow.
 - The default JDK for build and test steps is set by `TEST_JAVA_VERSION: 21` in [`ci.yml`](./workflows/ci.yml) line 43, and duplicated in [`populate-cache.yml`](./workflows/populate-cache.yml) line 39.  It matches the JDK bundled in the [`ghcr.io/apache/ozone-runner`](./workflows/check.yml) image.
 - All matrix jobs use `fail-fast: false` ([`ci.yml`](./workflows/ci.yml) lines 181, 215, 306, 352).  A failure in one matrix leg does not cancel its siblings.
 - Nearly every `ci.yml` job delegates its work to the reusable [`check.yml`](./workflows/check.yml) harness, which handles checkout, cache restore, Java setup, script execution, and artifact upload.  Only `coverage`, `generate-config-doc`, and `update-ozone-site-config-doc` don't use it.
+
+## Scope of work
+
+The pipeline layers several mechanisms that narrow what CI actually does on a given run: whether the workflow runs at all, which jobs inside it run, which matrix legs those jobs expand into, and — inside each leg — which Maven modules and tests are exercised.  As with Parallelism and Caching, most knobs are wired end-to-end; a few are dormant or dev-only, and one (the concurrency group key) uses a construct that cannot be verified from the workflow YAML alone.
+
+### Trigger & cancellation gates (working)
+
+| Gate | Location | Effect |
+|---|---|---|
+| Event filter on the top-level `CI` job | [`post-commit.yml`](./workflows/post-commit.yml) lines 27-29 | Runs on PRs and on non-`dependabot/*` pushes to `apache/ozone`.  For forks, runs on any branch push except `master` (so the fork's mirror of `master` does not double-run CI). |
+| `concurrency:` group + `cancel-in-progress` | [`post-commit.yml`](./workflows/post-commit.yml) lines 20-22 | Intent: per-PR grouping for `pull_request` events, per-SHA grouping for pushes to `apache/ozone`, per-branch grouping for fork pushes.  `cancel-in-progress` is `true` for PR events and for fork pushes.  See [Dormant / partial knobs](#dormant--partial-knobs) for the caveat on the group key expression. |
+| Draft-PR skip | [`selective_ci_checks.sh`](../dev-support/ci/selective_ci_checks.sh) lines 177-179 → `set_output_skip_all_tests_and_exit` (lines 98-107) | If `PR_DRAFT == "true"`, all six `needs-*` outputs and `basic-checks` are zeroed.  Every downstream job then sees its `if:` gate as false and is skipped. |
+| No-relevant-files skip | [`selective_ci_checks.sh`](../dev-support/ci/selective_ci_checks.sh) lines 165-172, 185-187 | If none of the changed files match `^.github`, `^dev-support`, `^hadoop-hdds`, `^hadoop-ozone`, or `^pom.xml`, the same skip path fires.  Root `*.md` files are already filtered out by the global `ignore_array` at line 43. |
+| Empty-changed-files fallback | [`selective_ci_checks.sh`](../dev-support/ci/selective_ci_checks.sh) lines 69-75 | If `git diff-tree` returns nothing (e.g. an unusual merge commit) the script emits a warning and runs everything, rather than treating it as a docs-only change. |
+
+### Selective checks: `build-info` outputs (working)
+
+The `build-info` job ([`ci.yml`](./workflows/ci.yml) lines 52-122) runs three scripts against the PR's changed-file list and emits a set of boolean flags plus two matrix lists.  Every downstream job in `ci.yml` gates on one of these flags — except `dependency`, `license`, and `repro`, which are unconditional once `build` has produced its artifacts.
+
+| Output | Producer | Consumer(s) in `ci.yml` | Notes |
+|---|---|---|---|
+| `needs-build` | [`selective_ci_checks.sh`](../dev-support/ci/selective_ci_checks.sh) lines 309-329 (direct) + 531-537 (transitive: forced true when compile / compose / kubernetes are needed) | `build` (line 127), `generate-config-doc` (line 146) | The `build` job also runs when `needs-integration-tests == 'true'` — that condition is added at line 127, not inside `set_outputs`. |
+| `needs-compile` | [`selective_ci_checks.sh`](../dev-support/ci/selective_ci_checks.sh) lines 331-348 | `compile` (line 173), `javadoc` (line 250) | |
+| `needs-compose-tests` | [`selective_ci_checks.sh`](../dev-support/ci/selective_ci_checks.sh) lines 229-244 + 298-307 + 490-521 | `acceptance` (line 289) | Robot-suite file changes force this on via `COUNT_ROBOT_CHANGED_FILES` (lines 512, 518). |
+| `needs-integration-tests` | [`selective_ci_checks.sh`](../dev-support/ci/selective_ci_checks.sh) lines 260-277 + 490-521 | `integration` (line 334) | |
+| `needs-kubernetes-tests` | [`selective_ci_checks.sh`](../dev-support/ci/selective_ci_checks.sh) lines 279-296 + 298-307 + 490-521 | `kubernetes` (line 315) | |
+| `basic-checks` (JSON list) | [`selective_ci_checks.sh`](../dev-support/ci/selective_ci_checks.sh) lines 350-447, 579-585 | `basic` matrix (line 214) via `categorize_basic_checks.sh` | `rat` is always included (line 579); the other six (`author`, `bats`, `checkstyle`, `docs`, `findbugs`, `pmd`) are added only when their file patterns match. |
+| `needs-basic-check` | [`categorize_basic_checks.sh`](../dev-support/ci/categorize_basic_checks.sh) lines 46-48 | `basic` (line 200) | Only emitted when the filtered list is non-empty; otherwise the output is absent and the `if: … == 'true'` gate falls through to false. |
+| `acceptance-suites` (JSON list) | [`acceptance_suites.sh`](../dev-support/ci/acceptance_suites.sh) lines 22-26 | `acceptance` matrix (line 305) | Always the full list of non-`failing` suites — no per-change filtering.  See [Matrix expansion](#matrix-expansion-working-coarse) below. |
+| `integration-suites` (JSON list) | [`integration_suites.sh`](../dev-support/ci/integration_suites.sh) lines 23-24 | `integration` matrix (line 351) | Always the full list of `test-*` profiles from `pom.xml` — no per-change filtering. |
+
+Two escape hatches override the whole computation:
+
+- **Environment-file changes** ([`selective_ci_checks.sh`](../dev-support/ci/selective_ci_checks.sh) lines 192-217): any change to `check.yml`, `ci.yml`, `post-commit.yml`, `dev-support/ci/*` (excluding the four one-offs at lines 202-205), or `hadoop-ozone/dev-support/checks/_lib.sh` triggers `set_outputs_run_everything_and_exit`.
+- **`full tests needed` PR label** ([`selective_ci_checks.sh`](../dev-support/ci/selective_ci_checks.sh) lines 46-59, 213-216): same effect, via the `PR_LABELS` env var forwarded from `ci.yml` line 102.
+
+When the workflow is called without a commit SHA (push, schedule, `workflow_dispatch`), the script also runs everything ([`selective_ci_checks.sh`](../dev-support/ci/selective_ci_checks.sh) lines 546-555).
+
+### Matrix expansion (working, coarse)
+
+Once a job's `needs-*` gate is true, its matrix expands to a fixed list:
+
+| Job | Matrix source | Legs |
+|---|---|---|
+| `basic` | [`categorize_basic_checks.sh`](../dev-support/ci/categorize_basic_checks.sh) | Only the basic checks whose file patterns matched (subset of `author`, `bats`, `checkstyle`, `docs`, `findbugs`, `pmd`, `rat`). |
+| `acceptance` | [`acceptance_suites.sh`](../dev-support/ci/acceptance_suites.sh) | Every `#suite:` tag under `hadoop-ozone/dist/src/main/compose` except `failing`. |
+| `integration` | [`integration_suites.sh`](../dev-support/ci/integration_suites.sh) | Every `<id>test-*</id>` profile in `pom.xml` (currently `client`, `container`, `filesystem`, `flaky`, `hdds`, `om`, `ozone`, `recon`, `snapshot`). |
+
+The two suite-list scripts do **not** consult the changed-file list — the selective-checks gate is a coarse on/off switch, and once it is on, every suite/profile runs.  This is by design; per-change suite filtering is not implemented.
+
+Note that the `split` input of [`check.yml`](./workflows/check.yml) lines 114-118 is display-only and is not a work-division parameter for these matrices; the working knob is `script-args` (see the [Parallelism section](#parallelism) for detail).
+
+### Maven scope narrowing inside check scripts (working)
+
+| Knob | Location | Effect |
+|---|---|---|
+| `-pl \!:ozone-integration-test,\!:ozone-integration-test-recon,\!:ozone-integration-test-s3,\!:mini-chaos-tests` | [`unit.sh`](../hadoop-ozone/dev-support/checks/unit.sh) lines 19-21 | Excludes the four integration-test aggregators from local unit runs; those modules are covered by the `integration` matrix in CI.  `unit.sh` itself is not invoked from `ci.yml` — it is the local-developer counterpart. |
+| `-am -pl :$SUBMODULE` | [`intermittent-test-check.yml`](./workflows/intermittent-test-check.yml) lines 139 (build), 205 (test) | Builds the selected integration submodule and its dependencies for the manual `flaky-test-check` workflow. |
+| `-Ptest-<profile>` | [`ci.yml`](./workflows/ci.yml) line 344 → profiles at [`pom.xml`](../pom.xml) lines 2713-2901 | Each profile sets a Surefire `<includes>` list matching one package tree and `<excludedGroups>` matching `flaky \| slow \| unhealthy`. |
+| `-Ptest-flaky` auto-adjustments | [`integration.sh`](../hadoop-ozone/dev-support/checks/integration.sh) lines 22-25 | Adds `-Dsurefire.rerunFailingTestsCount=5 -Dsurefire.fork.timeout=3600` when the args contain `-Ptest-flaky`.  The `test-flaky` profile itself ([`pom.xml`](../pom.xml) lines 2886-2901) narrows the run to `@Tag("flaky")` tests only. |
+| `-DskipShade` auto-inject | [`integration.sh`](../hadoop-ozone/dev-support/checks/integration.sh) lines 27-29 | Applied to every `-Ptest-*` leg except `-Ptest-filesystem` (which needs the shaded FS jar). |
+| `-DskipTests`, `-DskipDocs`, `-DskipRecon`, `-Djacoco.skip` | [`_build.sh`](../hadoop-ozone/dev-support/checks/_build.sh) lines 30-36; [`junit.sh`](../hadoop-ozone/dev-support/checks/junit.sh) lines 37-42 | Skip flags picked per script role: build skips tests, junit skips docs/Recon, both skip JaCoCo unless `OZONE_WITH_COVERAGE=true`. |
+
+### Test-time scope narrowing (working)
+
+| Knob | Location | Effect |
+|---|---|---|
+| `-Dtest=<class>` / `-Dtest=<class>#<method>` | [`intermittent-test-check.yml`](./workflows/intermittent-test-check.yml) lines 210, 214 | Single-class or single-method Surefire filter.  Only used by the manual `flaky-test-check` workflow.  Guardrails: `<surefire.failIfNoSpecifiedTests>false</surefire.failIfNoSpecifiedTests>` ([`pom.xml`](../pom.xml) line 212) and `<failIfNoTests>false</failIfNoTests>` (line 83) keep the filter from erroring in modules that don't contain the class. |
+| `OZONE_ACCEPTANCE_SUITE` | [`ci.yml`](./workflows/ci.yml) line 298 (`script-args: ${{ matrix.suite }}`) → [`acceptance.sh`](../hadoop-ozone/dev-support/checks/acceptance.sh) line 25 → [`testlib.sh`](../hadoop-ozone/dist/src/main/compose/testlib.sh) lines 88-113 | Selects one `#suite:` group per matrix leg.  The `misc` value also pulls in tests with no `#suite:` marker (`testlib.sh` lines 92-98). |
+| `OZONE_TEST_SELECTOR` | [`repeat-acceptance.yml`](./workflows/repeat-acceptance.yml) line 48 → [`testlib.sh`](../hadoop-ozone/dist/src/main/compose/testlib.sh) lines 104-110 | Regex filter over test-script paths.  Only exposed by the manual `repeat-acceptance-test` workflow. |
+
+### Iteration and fail-fast behavior
+
+These control whether an in-progress leg keeps running, so they belong in this section too:
+
+| Knob | Location | Effect |
+|---|---|---|
+| `ITERATIONS` loop | [`junit.sh`](../hadoop-ozone/dev-support/checks/junit.sh) lines 28, 68-112 | Repeats the Surefire run N times, each iteration in its own report directory.  Default `1`; only [`intermittent-test-check.yml`](./workflows/intermittent-test-check.yml) sets it higher. |
+| `FAIL_FAST=true` | [`junit.sh`](../hadoop-ozone/dev-support/checks/junit.sh) lines 27, 44-48, 109-111 | Injects `--fail-fast -Dsurefire.skipAfterFailureCount=1` and breaks the iteration loop on the first failing iteration.  CI leaves this at `false`, i.e. `--fail-never` — the leg finishes collecting failures. |
+| Matrix `fail-fast: false` | [`ci.yml`](./workflows/ci.yml) lines 181, 215, 306, 352 | See [Parallelism → Job-level fanout](#job-level-fanout-working). |
+| `OZONE_REPO_CACHED` | [`junit.sh`](../hadoop-ozone/dev-support/checks/junit.sh) lines 30, 59-61 | See [`OZONE_REPO_CACHED` signal](#ozone_repo_cached-signal-working-narrow-scope). |
+
+### Dormant / partial knobs
+
+- **`case(...)` in the concurrency group key** — [`post-commit.yml`](./workflows/post-commit.yml) line 21 and [`zizmor.yml`](./workflows/zizmor.yml) line 29 both use `case(github.repository == 'apache/ozone', github.sha, github.ref_name)`.  GitHub Actions' expression syntax does not document a `case(...)` function.  The commit that introduced this (`HDDS-12999`, `357aad73a1`) states the intended semantics — per-SHA groups on `apache/ozone`, per-branch groups on forks — but whether the live runtime evaluates the call that way, degrades it silently to an empty string (in which case every run would share the group `ci-` and cancel each other cross-PR), or does something else entirely is not derivable from reading the workflow.  This warrants empirical verification against production runs.  The `cancel-in-progress` boolean on line 22 uses standard boolean-OR syntax and evaluates correctly on its own.
+- **`find_test_class_project.sh`** — a complete helper at [`dev-support/ci/find_test_class_project.sh`](../dev-support/ci/find_test_class_project.sh) that maps a Java test class name to a `-pl` argument, with a `.bats` test alongside it.  Nothing in `.github/workflows` or `hadoop-ozone/dev-support/checks` invokes it, and [`selective_ci_checks.sh`](../dev-support/ci/selective_ci_checks.sh) explicitly ignores changes to it at lines 203 and 455.  It exists as a manual helper only; wiring it into CI would require a caller.
+- **`categorize_basic_checks.sh` single-category loop** — [`categorize_basic_checks.sh`](../dev-support/ci/categorize_basic_checks.sh) line 33 iterates `for check in basic`, and the outputs it produces (`needs-${check}-check`, `${check}-checks`) parameterize on that variable.  Only one category exists today, so the script is correct — but the shape suggests a multi-category design that was not completed.  Adding a second category (e.g. a hypothetical `slow` group) would require both a new marker in the check scripts and a caller-side output-name plumbing pass in `ci.yml`.
+- **Cross-refs**: the [`parallel-tests` Maven profile](#dormant-knobs), [JUnit 5 parallel execution](#dormant-knobs), [`check.yml`'s `split` input as a work-division parameter](#dormant-knobs), and [`workflow_call:` on `populate-cache.yml`](#dormant--low-yield) are documented in the Parallelism and Caching sections above and are all dormant from a scope-of-work perspective as well.
 
 ## Parallelism
 
