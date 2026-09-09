@@ -1,93 +1,357 @@
-# Ozone CI with Github Actions
+# Ozone CI with GitHub Actions
 
-The Ozone project uses Github Actions, (GA), for its CI system.  GA are implemented with workflows, which are groups of *jobs* combined to accomplish a CI task, all defined in a single yaml file.  The Ozone workflow yaml files are [here](./workflows).
+The Ozone project uses GitHub Actions (GA) for its CI system.  GA is implemented with *workflows*, which are groups of *jobs* combined to accomplish a CI task, all defined in a single YAML file.  The Ozone workflow YAML files live in [.github/workflows](./workflows).
+
+Every factual claim below is annotated with the file (and line, where useful) that backs it, so drift between this document and the actual CI is easier to spot.
+
+## Overview
+
+- The entry point for both push and pull-request events is [`post-commit.yml`](./workflows/post-commit.yml), whose workflow name is `build-branch`.  Its single job invokes [`ci.yml`](./workflows/ci.yml) (workflow name `full-ci`) via `workflow_call`.
+- Cross-job cancellation is handled by the `concurrency:` block in [`post-commit.yml`](./workflows/post-commit.yml) lines 20-22.  The intent — from `HDDS-12999` — is per-PR groups for pull requests, per-SHA groups for pushes to `apache/ozone` (no cancellation between commits), and per-branch groups for pushes to forks (cancel superseded runs on the same branch).  The line-21 group key uses a `case(...)` expression that is not part of GitHub Actions' documented expression syntax, so the observed runtime behavior of the key is not derivable from reading the workflow alone; see [Scope of work → Dormant / partial knobs](#dormant--partial-knobs) below.  There is no separate "Cancelling" workflow.
+- The default JDK for build and test steps is set by `TEST_JAVA_VERSION: 21` in [`ci.yml`](./workflows/ci.yml) line 43, and duplicated in [`populate-cache.yml`](./workflows/populate-cache.yml) line 39.  It matches the JDK bundled in the [`ghcr.io/apache/ozone-runner`](./workflows/check.yml) image.
+- All matrix jobs use `fail-fast: false` ([`ci.yml`](./workflows/ci.yml) lines 181, 215, 306, 352).  A failure in one matrix leg does not cancel its siblings.
+- Nearly every `ci.yml` job delegates its work to the reusable [`check.yml`](./workflows/check.yml) harness, which handles checkout, cache restore, Java setup, script execution, and artifact upload.  Only `coverage`, `generate-config-doc`, and `update-ozone-site-config-doc` don't use it.
+
+## Scope of work
+
+The pipeline layers several mechanisms that narrow what CI actually does on a given run: whether the workflow runs at all, which jobs inside it run, which matrix legs those jobs expand into, and — inside each leg — which Maven modules and tests are exercised.  As with Parallelism and Caching, most knobs are wired end-to-end; a few are dormant or dev-only, and one (the concurrency group key) uses a construct that cannot be verified from the workflow YAML alone.
+
+### Trigger & cancellation gates (working)
+
+| Gate | Location | Effect |
+|---|---|---|
+| Event filter on the top-level `CI` job | [`post-commit.yml`](./workflows/post-commit.yml) lines 27-29 | Runs on PRs and on non-`dependabot/*` pushes to `apache/ozone`.  For forks, runs on any branch push except `master` (so the fork's mirror of `master` does not double-run CI). |
+| `concurrency:` group + `cancel-in-progress` | [`post-commit.yml`](./workflows/post-commit.yml) lines 20-22 | Intent: per-PR grouping for `pull_request` events, per-SHA grouping for pushes to `apache/ozone`, per-branch grouping for fork pushes.  `cancel-in-progress` is `true` for PR events and for fork pushes.  See [Dormant / partial knobs](#dormant--partial-knobs) for the caveat on the group key expression. |
+| Draft-PR skip | [`selective_ci_checks.sh`](../dev-support/ci/selective_ci_checks.sh) lines 177-179 → `set_output_skip_all_tests_and_exit` (lines 98-107) | If `PR_DRAFT == "true"`, all six `needs-*` outputs and `basic-checks` are zeroed.  Every downstream job then sees its `if:` gate as false and is skipped. |
+| No-relevant-files skip | [`selective_ci_checks.sh`](../dev-support/ci/selective_ci_checks.sh) lines 165-172, 185-187 | If none of the changed files match `^.github`, `^dev-support`, `^hadoop-hdds`, `^hadoop-ozone`, or `^pom.xml`, the same skip path fires.  Root `*.md` files are already filtered out by the global `ignore_array` at line 43. |
+| Empty-changed-files fallback | [`selective_ci_checks.sh`](../dev-support/ci/selective_ci_checks.sh) lines 69-75 | If `git diff-tree` returns nothing (e.g. an unusual merge commit) the script emits a warning and runs everything, rather than treating it as a docs-only change. |
+
+### Selective checks: `build-info` outputs (working)
+
+The `build-info` job ([`ci.yml`](./workflows/ci.yml) lines 52-122) runs three scripts against the PR's changed-file list and emits a set of boolean flags plus two matrix lists.  Every downstream job in `ci.yml` gates on one of these flags — except `dependency`, `license`, and `repro`, which are unconditional once `build` has produced its artifacts.
+
+| Output | Producer | Consumer(s) in `ci.yml` | Notes |
+|---|---|---|---|
+| `needs-build` | [`selective_ci_checks.sh`](../dev-support/ci/selective_ci_checks.sh) lines 309-329 (direct) + 531-537 (transitive: forced true when compile / compose / kubernetes are needed) | `build` (line 127), `generate-config-doc` (line 146) | The `build` job also runs when `needs-integration-tests == 'true'` — that condition is added at line 127, not inside `set_outputs`. |
+| `needs-compile` | [`selective_ci_checks.sh`](../dev-support/ci/selective_ci_checks.sh) lines 331-348 | `compile` (line 173), `javadoc` (line 250) | |
+| `needs-compose-tests` | [`selective_ci_checks.sh`](../dev-support/ci/selective_ci_checks.sh) lines 229-244 + 298-307 + 490-521 | `acceptance` (line 289) | Robot-suite file changes force this on via `COUNT_ROBOT_CHANGED_FILES` (lines 512, 518). |
+| `needs-integration-tests` | [`selective_ci_checks.sh`](../dev-support/ci/selective_ci_checks.sh) lines 260-277 + 490-521 | `integration` (line 334) | |
+| `needs-kubernetes-tests` | [`selective_ci_checks.sh`](../dev-support/ci/selective_ci_checks.sh) lines 279-296 + 298-307 + 490-521 | `kubernetes` (line 315) | |
+| `basic-checks` (JSON list) | [`selective_ci_checks.sh`](../dev-support/ci/selective_ci_checks.sh) lines 350-447, 579-585 | `basic` matrix (line 214) via `categorize_basic_checks.sh` | `rat` is always included (line 579); the other six (`author`, `bats`, `checkstyle`, `docs`, `findbugs`, `pmd`) are added only when their file patterns match. |
+| `needs-basic-check` | [`categorize_basic_checks.sh`](../dev-support/ci/categorize_basic_checks.sh) lines 46-48 | `basic` (line 200) | Only emitted when the filtered list is non-empty; otherwise the output is absent and the `if: … == 'true'` gate falls through to false. |
+| `acceptance-suites` (JSON list) | [`acceptance_suites.sh`](../dev-support/ci/acceptance_suites.sh) lines 22-26 | `acceptance` matrix (line 305) | Always the full list of non-`failing` suites — no per-change filtering.  See [Matrix expansion](#matrix-expansion-working-coarse) below. |
+| `integration-suites` (JSON list) | [`integration_suites.sh`](../dev-support/ci/integration_suites.sh) lines 23-24 | `integration` matrix (line 351) | Always the full list of `test-*` profiles from `pom.xml` — no per-change filtering. |
+
+Two escape hatches override the whole computation:
+
+- **Environment-file changes** ([`selective_ci_checks.sh`](../dev-support/ci/selective_ci_checks.sh) lines 192-217): any change to `check.yml`, `ci.yml`, `post-commit.yml`, `dev-support/ci/*` (excluding the four one-offs at lines 202-205), or `hadoop-ozone/dev-support/checks/_lib.sh` triggers `set_outputs_run_everything_and_exit`.
+- **`full tests needed` PR label** ([`selective_ci_checks.sh`](../dev-support/ci/selective_ci_checks.sh) lines 46-59, 213-216): same effect, via the `PR_LABELS` env var forwarded from `ci.yml` line 102.
+
+When the workflow is called without a commit SHA (push, schedule, `workflow_dispatch`), the script also runs everything ([`selective_ci_checks.sh`](../dev-support/ci/selective_ci_checks.sh) lines 546-555).
+
+### Matrix expansion (working, coarse)
+
+Once a job's `needs-*` gate is true, its matrix expands to a fixed list:
+
+| Job | Matrix source | Legs |
+|---|---|---|
+| `basic` | [`categorize_basic_checks.sh`](../dev-support/ci/categorize_basic_checks.sh) | Only the basic checks whose file patterns matched (subset of `author`, `bats`, `checkstyle`, `docs`, `findbugs`, `pmd`, `rat`). |
+| `acceptance` | [`acceptance_suites.sh`](../dev-support/ci/acceptance_suites.sh) | Every `#suite:` tag under `hadoop-ozone/dist/src/main/compose` except `failing`. |
+| `integration` | [`integration_suites.sh`](../dev-support/ci/integration_suites.sh) | Every `<id>test-*</id>` profile in `pom.xml` (currently `client`, `container`, `filesystem`, `flaky`, `hdds`, `om`, `ozone`, `recon`, `snapshot`). |
+
+The two suite-list scripts do **not** consult the changed-file list — the selective-checks gate is a coarse on/off switch, and once it is on, every suite/profile runs.  This is by design; per-change suite filtering is not implemented.
+
+Note that the `split` input of [`check.yml`](./workflows/check.yml) lines 114-118 is display-only and is not a work-division parameter for these matrices; the working knob is `script-args` (see the [Parallelism section](#parallelism) for detail).
+
+### Maven scope narrowing inside check scripts (working)
+
+| Knob | Location | Effect |
+|---|---|---|
+| `-pl \!:ozone-integration-test,\!:ozone-integration-test-recon,\!:ozone-integration-test-s3,\!:mini-chaos-tests` | [`unit.sh`](../hadoop-ozone/dev-support/checks/unit.sh) lines 19-21 | Excludes the four integration-test aggregators from local unit runs; those modules are covered by the `integration` matrix in CI.  `unit.sh` itself is not invoked from `ci.yml` — it is the local-developer counterpart. |
+| `-am -pl :$SUBMODULE` | [`intermittent-test-check.yml`](./workflows/intermittent-test-check.yml) lines 139 (build), 205 (test) | Builds the selected integration submodule and its dependencies for the manual `flaky-test-check` workflow. |
+| `-Ptest-<profile>` | [`ci.yml`](./workflows/ci.yml) line 344 → profiles at [`pom.xml`](../pom.xml) lines 2713-2901 | Each profile sets a Surefire `<includes>` list matching one package tree and `<excludedGroups>` matching `flaky \| slow \| unhealthy`. |
+| `-Ptest-flaky` auto-adjustments | [`integration.sh`](../hadoop-ozone/dev-support/checks/integration.sh) lines 22-25 | Adds `-Dsurefire.rerunFailingTestsCount=5 -Dsurefire.fork.timeout=3600` when the args contain `-Ptest-flaky`.  The `test-flaky` profile itself ([`pom.xml`](../pom.xml) lines 2886-2901) narrows the run to `@Tag("flaky")` tests only. |
+| `-DskipShade` auto-inject | [`integration.sh`](../hadoop-ozone/dev-support/checks/integration.sh) lines 27-29 | Applied to every `-Ptest-*` leg except `-Ptest-filesystem` (which needs the shaded FS jar). |
+| `-DskipTests`, `-DskipDocs`, `-DskipRecon`, `-Djacoco.skip` | [`_build.sh`](../hadoop-ozone/dev-support/checks/_build.sh) lines 30-36; [`junit.sh`](../hadoop-ozone/dev-support/checks/junit.sh) lines 37-42 | Skip flags picked per script role: build skips tests, junit skips docs/Recon, both skip JaCoCo unless `OZONE_WITH_COVERAGE=true`. |
+
+### Test-time scope narrowing (working)
+
+| Knob | Location | Effect |
+|---|---|---|
+| `-Dtest=<class>` / `-Dtest=<class>#<method>` | [`intermittent-test-check.yml`](./workflows/intermittent-test-check.yml) lines 210, 214 | Single-class or single-method Surefire filter.  Only used by the manual `flaky-test-check` workflow.  Guardrails: `<surefire.failIfNoSpecifiedTests>false</surefire.failIfNoSpecifiedTests>` ([`pom.xml`](../pom.xml) line 212) and `<failIfNoTests>false</failIfNoTests>` (line 83) keep the filter from erroring in modules that don't contain the class. |
+| `OZONE_ACCEPTANCE_SUITE` | [`ci.yml`](./workflows/ci.yml) line 298 (`script-args: ${{ matrix.suite }}`) → [`acceptance.sh`](../hadoop-ozone/dev-support/checks/acceptance.sh) line 25 → [`testlib.sh`](../hadoop-ozone/dist/src/main/compose/testlib.sh) lines 88-113 | Selects one `#suite:` group per matrix leg.  The `misc` value also pulls in tests with no `#suite:` marker (`testlib.sh` lines 92-98). |
+| `OZONE_TEST_SELECTOR` | [`repeat-acceptance.yml`](./workflows/repeat-acceptance.yml) line 48 → [`testlib.sh`](../hadoop-ozone/dist/src/main/compose/testlib.sh) lines 104-110 | Regex filter over test-script paths.  Only exposed by the manual `repeat-acceptance-test` workflow. |
+
+### Iteration and fail-fast behavior
+
+These control whether an in-progress leg keeps running, so they belong in this section too:
+
+| Knob | Location | Effect |
+|---|---|---|
+| `ITERATIONS` loop | [`junit.sh`](../hadoop-ozone/dev-support/checks/junit.sh) lines 28, 68-112 | Repeats the Surefire run N times, each iteration in its own report directory.  Default `1`; only [`intermittent-test-check.yml`](./workflows/intermittent-test-check.yml) sets it higher. |
+| `FAIL_FAST=true` | [`junit.sh`](../hadoop-ozone/dev-support/checks/junit.sh) lines 27, 44-48, 109-111 | Injects `--fail-fast -Dsurefire.skipAfterFailureCount=1` and breaks the iteration loop on the first failing iteration.  CI leaves this at `false`, i.e. `--fail-never` — the leg finishes collecting failures. |
+| Matrix `fail-fast: false` | [`ci.yml`](./workflows/ci.yml) lines 181, 215, 306, 352 | See [Parallelism → Job-level fanout](#job-level-fanout-working). |
+| `OZONE_REPO_CACHED` | [`junit.sh`](../hadoop-ozone/dev-support/checks/junit.sh) lines 30, 59-61 | See [`OZONE_REPO_CACHED` signal](#ozone_repo_cached-signal-working-narrow-scope). |
+
+### Dormant / partial knobs
+
+- **`case(...)` in the concurrency group key** — [`post-commit.yml`](./workflows/post-commit.yml) line 21 and [`zizmor.yml`](./workflows/zizmor.yml) line 29 both use `case(github.repository == 'apache/ozone', github.sha, github.ref_name)`.  GitHub Actions' expression syntax does not document a `case(...)` function.  The commit that introduced this (`HDDS-12999`, `357aad73a1`) states the intended semantics — per-SHA groups on `apache/ozone`, per-branch groups on forks — but whether the live runtime evaluates the call that way, degrades it silently to an empty string (in which case every run would share the group `ci-` and cancel each other cross-PR), or does something else entirely is not derivable from reading the workflow.  This warrants empirical verification against production runs.  The `cancel-in-progress` boolean on line 22 uses standard boolean-OR syntax and evaluates correctly on its own.
+- **`find_test_class_project.sh`** — a complete helper at [`dev-support/ci/find_test_class_project.sh`](../dev-support/ci/find_test_class_project.sh) that maps a Java test class name to a `-pl` argument, with a `.bats` test alongside it.  Nothing in `.github/workflows` or `hadoop-ozone/dev-support/checks` invokes it, and [`selective_ci_checks.sh`](../dev-support/ci/selective_ci_checks.sh) explicitly ignores changes to it at lines 203 and 455.  It exists as a manual helper only; wiring it into CI would require a caller.
+- **`categorize_basic_checks.sh` single-category loop** — [`categorize_basic_checks.sh`](../dev-support/ci/categorize_basic_checks.sh) line 33 iterates `for check in basic`, and the outputs it produces (`needs-${check}-check`, `${check}-checks`) parameterize on that variable.  Only one category exists today, so the script is correct — but the shape suggests a multi-category design that was not completed.  Adding a second category (e.g. a hypothetical `slow` group) would require both a new marker in the check scripts and a caller-side output-name plumbing pass in `ci.yml`.
+- **Cross-refs**: the [`parallel-tests` Maven profile](#dormant-knobs), [JUnit 5 parallel execution](#dormant-knobs), [`check.yml`'s `split` input as a work-division parameter](#dormant-knobs), and [`workflow_call:` on `populate-cache.yml`](#dormant--low-yield) are documented in the Parallelism and Caching sections above and are all dormant from a scope-of-work perspective as well.
+
+## Parallelism
+
+The CI pipeline layers several parallelism mechanisms, some effective and some dormant.  The status of each is called out below so that a future reader can tell working knobs from ones that have been added, disabled, or never activated.
+
+### Job-level fanout (working)
+
+- The `concurrency:` group in [`post-commit.yml`](./workflows/post-commit.yml) lines 20-22 cancels superseded runs for PRs and non-`apache/ozone` pushes.
+- Four matrices in [`ci.yml`](./workflows/ci.yml) run their legs concurrently, all with `fail-fast: false`:
+  - `compile` (lines 174-181): Java **8**, **11**, **17** on `ubuntu-24.04` plus Java **21** on `macos-15`.
+  - `basic` (lines 212-215): one leg per basic check selected by `build-info`.
+  - `acceptance` (lines 303-306): one leg per suite from [`acceptance_suites.sh`](../dev-support/ci/acceptance_suites.sh).
+  - `integration` (lines 349-352): one leg per profile from [`integration_suites.sh`](../dev-support/ci/integration_suites.sh) (`client`, `container`, `filesystem`, `flaky`, `hdds`, `om`, `ozone`, `recon`, `snapshot`).
+- Every matrix leg is dispatched through [`check.yml`](./workflows/check.yml).  The `split` input (lines 114-118) is used **only** to disambiguate the job display name (line 150) and the uploaded artifact name (line 272) — it is not forwarded to the check script as an env var.  Work division for the four `ci.yml` matrices happens through `script-args` (e.g. `-Ptest-${{ matrix.profile }}` at line 344), not through `split`.
+- [`intermittent-test-check.yml`](./workflows/intermittent-test-check.yml) (lines 88-94, 160-162) and [`repeat-acceptance.yml`](./workflows/repeat-acceptance.yml) (lines 72-78, 133-135) construct a `[1..N]` split matrix, but each leg runs **the same test class or suite** — splits are concurrent replicas for flakiness detection, not a work-division scheme.  In `intermittent-test-check.yml`, the total number of executions is `splits × iterations`, where `iterations` drives the sequential `ITERATIONS` loop inside [`junit.sh`](../hadoop-ozone/dev-support/checks/junit.sh) (lines 28, 68).
+
+### Maven reactor parallelism (`-T 1C`)
+
+`-T 1C` runs one Maven builder thread per available core across the *reactor* — it parallelizes module builds, not Surefire forks within a single module.  For per-module goals it works; for aggregator goals that execute once at the reactor root it is a no-op, and for the CI `integration` job it is actively unsafe (see [Removed sites](#removed--t-1c-sites) below).
+
+| Script | Line | Goal | Effective? |
+|---|---|---|---|
+| [`_build.sh`](../hadoop-ozone/dev-support/checks/_build.sh) | 30 | full build lifecycle (used by `build.sh`, `compile.sh`, `repro.sh`) | Yes |
+| [`checkstyle.sh`](../hadoop-ozone/dev-support/checks/checkstyle.sh) | 27 | `checkstyle:check` | Yes |
+| [`pmd.sh`](../hadoop-ozone/dev-support/checks/pmd.sh) | 29 | `pmd:check` | Yes |
+| [`findbugs.sh`](../hadoop-ozone/dev-support/checks/findbugs.sh) | 33 | `spotbugs:check` | Yes |
+| [`rat.sh`](../hadoop-ozone/dev-support/checks/rat.sh) | 27 | `apache-rat-plugin:check` | Yes |
+| [`populate-cache.yml`](./workflows/populate-cache.yml) | 38, 100 | `-Pgo-offline clean verify` and Java 8 `test-compile` | Yes |
+
+#### Removed `-T 1C` sites
+
+`-T 1C` was previously also present in three scripts where it was either a no-op or unsafe; it has been removed:
+
+- [`javadoc.sh`](../hadoop-ozone/dev-support/checks/javadoc.sh) — invokes `javadoc:aggregate`, an aggregator goal that binds to the reactor root and runs once.  `-T` cannot split it.
+- [`license.sh`](../hadoop-ozone/dev-support/checks/license.sh) — invokes `license:aggregate-add-third-party` — same reason as `javadoc:aggregate`.
+- [`junit.sh`](../hadoop-ozone/dev-support/checks/junit.sh) — used by the `integration` job via [`integration.sh`](../hadoop-ozone/dev-support/checks/integration.sh).  The CI `integration` job does not restrict the reactor (`ci.yml` line 344 passes only `-Ptest-<profile> -Drocks_tools_native`), so `-T 1C` caused several modules to execute Surefire concurrently, one per builder thread.  Each Surefire still used the default `forkCount=1` because the [`parallel-tests` profile](#dormant-knobs) that would apply per-fork isolation is not activated.  `MiniOzoneCluster` (which binds fixed default ports and shares `test.build.data` when isolation is off) could therefore run in more than one JVM at once with no coordination — a source of intermittent port-bind / stale-state failures.  Re-introducing intra-module parallelism should go through the `parallel-tests` profile instead (see [Dormant knobs](#dormant-knobs)).
+
+### Surefire and JVM knobs (working)
+
+These apply to every test run, whether or not any `-T` flag is present.
+
+| Knob | Location | Effect |
+|---|---|---|
+| `reuseForks=false` | [`pom.xml`](../pom.xml) line 2373 | Each test class runs in a fresh JVM. |
+| `forkedProcessTimeoutInSeconds=${surefire.fork.timeout}` (default `1200`s) | [`pom.xml`](../pom.xml) lines 2374, 213 | Kills stuck forks. |
+| `-Xmx8192m -XX:+HeapDumpOnOutOfMemoryError` | [`pom.xml`](../pom.xml) line 150 | Per-fork heap ceiling, injected into `argLine`. |
+| `MALLOC_ARENA_MAX=4` | [`pom.xml`](../pom.xml) line 2379 | Caps glibc arenas to reduce RSS across parallel forks. |
+| `surefire.rerunFailingTestsCount=5` + `surefire.fork.timeout=3600` | [`integration.sh`](../hadoop-ozone/dev-support/checks/integration.sh) lines 22-23 | Auto-injected only when `-Ptest-flaky` is in the args. |
+
+The [`test-flaky` profile](../pom.xml) (line 2888) is one of the profiles emitted by `integration_suites.sh`, so the `flaky` matrix leg is what enables both reruns and the 60-minute per-fork timeout.
+
+### Dormant knobs
+
+- **`parallel-tests` Maven profile** — defined in [`hadoop-hdds/pom.xml`](../hadoop-hdds/pom.xml) lines 94-138 and [`hadoop-ozone/pom.xml`](../hadoop-ozone/pom.xml) lines 140-185.  Would set `forkCount=${testsThreadCount}`, `reuseForks=false`, per-fork `test.build.data` / `hadoop.tmp.dir` / `test.unique.fork.id` system properties, and wire in the `parallel-tests-createdir` goal.  Nothing under [`.github/workflows`](./workflows) or [`hadoop-ozone/dev-support/checks/`](../hadoop-ozone/dev-support/checks) activates it.  The `testsThreadCount` property ([`pom.xml`](../pom.xml) line 218, default 4), the per-fork sysprops, and the `-DminiClusterDedicatedDirs=true` flag inside the profile are therefore unused as CI is configured.
+- **JUnit 5 parallel execution** — [`pom.xml`](../pom.xml) lines 2400-2404 set `junit.jupiter.execution.parallel.enabled = true`, but the default execution mode is `same_thread`, so tests only run concurrently if they opt in via `@Execution(CONCURRENT)`.  A repo-wide grep for `@Execution(` and `@Isolated` finds two annotated files (`TestDiskCheckUtil`, `TestOmSnapshotManagerConfig`), so in practice this engine is doing no meaningful concurrency.
+- **`check.yml`'s `split` input as a work-division parameter** — the input exists (lines 114-118) but is never passed into the check script.  Work division for `acceptance` and `integration` happens through `script-args`, not through `split`.
+
+## Caching and resource re-use
+
+The CI pipeline shares work across jobs and runs through four channels: the GitHub Actions cache service (Maven repo, pnpm store, NodeJS bootstrap, Java distributions), GitHub Actions artifacts (`ozone-bin`, `ozone-src`, `ozone-repo`, `ratis-jars`), Develocity (build scans only — see below), and container images pulled from GHCR.  As with Parallelism, several mechanisms are working, one is deliberately branch-gated, and a few carry small dead spots worth calling out.
+
+### Cache lookups (working)
+
+| Cache | Producer | Consumers | Key | Path |
+|---|---|---|---|---|
+| Maven dependency cache | [`populate-cache.yml`](./workflows/populate-cache.yml) lines 110-117 (`actions/cache/save`); trigger lines 21-32; populated by `mvn -Pgo-offline clean verify` at Java 21 (line 89) and `mvn -Pgo-offline -DskipRecon -DskipShade test-compile` at Java 8 (line 100); Ozone jars deleted before save (line 104) | Restore-only: [`check.yml`](./workflows/check.yml) lines 183-192 (default via `needs-maven-cache`), [`ci.yml`](./workflows/ci.yml) lines 369-377 (inline `coverage`), [`intermittent-test-check.yml`](./workflows/intermittent-test-check.yml) lines 114-122 and 168-176, [`repeat-acceptance.yml`](./workflows/repeat-acceptance.yml) lines 99-108 | `maven-repo-${{ hashFiles('**/pom.xml') }}`, restore-keys `maven-repo-` | `~/.m2/repository/*/*/*` with `!~/.m2/repository/org/apache/ozone` |
+| pnpm store | [`check.yml`](./workflows/check.yml) lines 173-181 (full `actions/cache`, gated by `needs-npm-cache`); populated by `pnpm install --frozen-lockfile` invoked from `hadoop-ozone/recon/pom.xml` during `build`. Only [`ci.yml`](./workflows/ci.yml) line 131 sets `needs-npm-cache: true`. | Same step is both save and restore; also restored by [`repeat-acceptance.yml`](./workflows/repeat-acceptance.yml) lines 90-98 | `${{ runner.os }}-pnpm-${{ hashFiles('**/pnpm-lock.yaml') }}` | `~/.pnpm-store` |
+| NodeJS bootstrap | [`populate-cache.yml`](./workflows/populate-cache.yml) lines 73-85, downloaded by [`dev-support/ci/download-nodejs.sh`](../dev-support/ci/download-nodejs.sh) | Only [`populate-cache.yml`](./workflows/populate-cache.yml) itself — downstream consumers pick up the same path via the main Maven-repo cache | `nodejs-${{ steps.nodejs-version.outputs.nodejs-version }}` | `~/.m2/repository/com/github/eirslett/node` |
+| Java distributions | `actions/setup-java@v5` implicit cache | [`check.yml`](./workflows/check.yml) lines 224-229, [`populate-cache.yml`](./workflows/populate-cache.yml) lines 63-66 and 93-96, [`ci.yml`](./workflows/ci.yml) line 387, [`repeat-acceptance.yml`](./workflows/repeat-acceptance.yml) line 110, [`intermittent-test-check.yml`](./workflows/intermittent-test-check.yml) line 192, [`build-ratis.yml`](./workflows/build-ratis.yml) lines 84-88 | Managed by `setup-java` | Toolcache |
+| Ratis dependencies | [`build-ratis.yml`](./workflows/build-ratis.yml) lines 77-83 (full `actions/cache`) | Same job only.  Scoped to the *Ratis* checkout's `**/pom.xml`, so it only pays off when re-building the same Ratis ref — see [Dormant / low-yield](#dormant--low-yield). | `ratis-dependencies-${{ hashFiles('**/pom.xml') }}` | `~/.m2/repository` with `!~/.m2/repository/org/apache/ratis` |
+
+Consumers of the Maven-repo cache deliberately use `actions/cache/restore@` rather than `actions/cache@`: [`populate-cache.yml`](./workflows/populate-cache.yml) is the sole producer, and every other workflow is read-only.  This is why a run against a `pom.xml` change may miss cache until the next `populate-cache` run — the daily cron at [`scheduled-cache-update.yml`](./workflows/scheduled-cache-update.yml) line 22 (`20 3 * * *`) and the pom-change push trigger ([`populate-cache.yml`](./workflows/populate-cache.yml) lines 21-30) are the two paths that refresh it.
+
+### Build artifacts (working)
+
+All four are uploaded with `retention-days: 1`.
+
+| Artifact | Producer | Consumers | `check.yml` gate flag |
+|---|---|---|---|
+| `ozone-bin` (Ozone binary tarball) | [`check.yml`](./workflows/check.yml) lines 279-287 (when `inputs.script == 'build'`); also [`repeat-acceptance.yml`](./workflows/repeat-acceptance.yml) lines 118-125 | [`check.yml`](./workflows/check.yml) lines 211-222 (extracts to `hadoop-ozone/dist/target`); wired in [`ci.yml`](./workflows/ci.yml) for `dependency` (line 226), `acceptance` (line 295), `kubernetes` (line 320); also [`generate-config-doc.yml`](./workflows/generate-config-doc.yml) lines 41-50; `coverage` downloads all artifacts and untars this one ([`ci.yml`](./workflows/ci.yml) lines 378-385) | `needs-ozone-binary-tarball` |
+| `ozone-src` (Ozone source tarball) | [`check.yml`](./workflows/check.yml) lines 289-296 | [`check.yml`](./workflows/check.yml) lines 162-171 (extracts to workspace root, replaces checkout); wired in [`ci.yml`](./workflows/ci.yml) for `compile` (line 185) | `needs-ozone-source-tarball` |
+| `ozone-repo` (Ozone-built Maven jars) | [`check.yml`](./workflows/check.yml) lines 298-305; also [`intermittent-test-check.yml`](./workflows/intermittent-test-check.yml) lines 144-150 in the build phase | [`check.yml`](./workflows/check.yml) lines 194-201 (extracts to `~/.m2/repository/org/apache/ozone`); wired in [`ci.yml`](./workflows/ci.yml) for `license` (line 240), `javadoc` (line 256), `repro` (line 273), `integration` (line 340); [`intermittent-test-check.yml`](./workflows/intermittent-test-check.yml) lines 184-191 downloads with `continue-on-error: true` | `needs-ozone-repo` |
+| `ratis-jars` (custom Ratis Maven jars) | [`build-ratis.yml`](./workflows/build-ratis.yml) lines 103-109; only produced when running [`ci-with-ratis.yml`](./workflows/ci-with-ratis.yml) or [`intermittent-test-check.yml`](./workflows/intermittent-test-check.yml) with a Ratis ref | [`check.yml`](./workflows/check.yml) lines 203-209 (gated on `inputs.ratis-args != ''`); [`intermittent-test-check.yml`](./workflows/intermittent-test-check.yml) lines 123-129 and 177-183 (gated on `inputs.ratis-ref`) | Implicit — download key is the `ratis-args` input, not a `needs-*` boolean |
+
+### `OZONE_REPO_CACHED` signal (working, narrow scope)
+
+[`junit.sh`](../hadoop-ozone/dev-support/checks/junit.sh) line 30 defaults `OZONE_REPO_CACHED=false`; at line 59, when `ITERATIONS > 1` and the flag is still `false`, the script runs a preparatory `mvn -DskipTests install` so that per-iteration test runs don't repeatedly rebuild sibling modules.  Only [`intermittent-test-check.yml`](./workflows/intermittent-test-check.yml) line 200 exports the flag as `true`, and only when the `ozone-repo` artifact was actually downloaded (the download at lines 184-191 is `continue-on-error: true`).  Nothing else in the pipeline drives iteration counts through `junit.sh`, so this signal never fires from the main `ci.yml` graph — that is intentional, not broken.
+
+### Develocity build scans (branch-gated, scans-only)
+
+The Develocity Maven extension is loaded unconditionally through [`.mvn/extensions.xml`](../.mvn/extensions.xml) lines 24-33 (`develocity-maven-extension` 1.22.2 + `common-custom-user-data-maven-extension` 2.2.0).  [`.mvn/develocity.xml`](../.mvn/develocity.xml) then narrows what actually happens:
+
+- Line 38 restricts scan **publishing** to `scans.gradle.com` to runs where `GITHUB_REF_NAME` or `GITHUB_HEAD_REF` is `maven-optimizations-project`.  Every other branch captures a scan and drops it.
+- Lines 44-47 enable the **local** build cache only when `GITHUB_ACTIONS` is unset — i.e. developer machines only.  Inside CI it is off.
+- Lines 48-50 disable the **remote** build cache entirely.
+
+`DEVELOCITY_ACCESS_KEY` is threaded through the pipeline ([`post-commit.yml`](./workflows/post-commit.yml) line 32 → [`ci.yml`](./workflows/ci.yml) line 30 → every job's `env:` block, e.g. [`ci.yml`](./workflows/ci.yml) lines 139, 195, 211, 223, 237, 253, 270, 292, 318, 337, 399; [`check.yml`](./workflows/check.yml) line 243).  Because remote build cache is disabled, that credential is **scan publishing only** — not a build-cache credential.  On any branch other than `maven-optimizations-project` the key is passed but not used.
+
+### Container images
+
+[`check.yml`](./workflows/check.yml) lines 138-142 defines `HADOOP_IMAGE`, `OZONE_IMAGE`, and `OZONE_RUNNER_IMAGE` (all `ghcr.io/apache/…`).  Images are pulled from GHCR at test time; caching is delegated to the runner's Docker daemon — there is no GHA cache entry for images.
+
+### Dormant / low-yield
+
+- **`workflow_call:` on [`populate-cache.yml`](./workflows/populate-cache.yml)** (line 31) — declared but no other workflow currently invokes it.  Harmless but unused.
+- **Java-version suffix in [`repeat-acceptance.yml`](./workflows/repeat-acceptance.yml)'s Maven cache key** (line 105: `maven-repo-${{ hashFiles('**/pom.xml') }}-${{ env.JAVA_VERSION }}`) — the step is `actions/cache/restore@` (line 100), so the suffixed key is never *saved* anywhere; the lookup always falls through to the plain `maven-repo-${{ hashFiles('**/pom.xml') }}` restore-key populated by `populate-cache.yml`.  The `-${JAVA_VERSION}` suffix is dead as configured.
+- **`node_modules` not cached in [`check.yml`](./workflows/check.yml)** — line 177 caches only `~/.pnpm-store`, whereas [`repeat-acceptance.yml`](./workflows/repeat-acceptance.yml) lines 93-95 cache both `~/.pnpm-store` and `**/node_modules`.  Not broken; `pnpm install --frozen-lockfile` still relinks from the store, so this leaves a small speedup on the table.
+- **Ratis dependencies cache** ([`build-ratis.yml`](./workflows/build-ratis.yml) lines 77-83) — full `actions/cache@`, so both restore and save.  Keyed on the *Ratis* checkout's `**/pom.xml`, so it only helps when re-building the same Ratis ref+pom; that path is rare in practice.
+- **`parallel-tests` Maven profile and the `check.yml` `split` input as work-division** — already documented under [Dormant knobs](#dormant-knobs) in the Parallelism section.  Both remain unused; noted here so the caching/artifact story doesn't imply otherwise.
 
 ## Workflows
 
-### full-ci Workflow
-This is the most important [workflow](./workflows/ci.yml).  It runs the tests that verify the latest commits.
+### build-branch ([post-commit.yml](./workflows/post-commit.yml))
 
-It is triggered each time a pull request is created or synchronized (i.e. when the remote branch is pushed to).  These trigger events are defined in the [build-branch workflow](./workflows/post-commit.yml).
+- Triggers: `pull_request` types `[opened, ready_for_review, synchronize]` and any `push` (lines 17-19).
+- `concurrency:` group cancels in-progress runs for PRs and non-`apache/ozone` pushes (lines 20-22).
+- The single `CI` job invokes [`ci.yml`](./workflows/ci.yml) via `workflow_call` (line 30) and forwards the `DEVELOCITY_ACCESS_KEY`, `OZONE_WEBSITE_BUILD`, and `SONARCLOUD_TOKEN` secrets.
 
-The full-ci workflow is divided into a number of different jobs, most of which run in parallel.  Each job is described below.
+### full-ci ([ci.yml](./workflows/ci.yml))
 
-Some of the jobs are defined using GA's "build matrix" feature.  This allows you define similar jobs with a single job definition. Any differences are specified by a list of values for a specific key.  For example, the "compile" job uses the matrix feature to generate the images with different versions of java.  There, the matrix is specified by the "java" key which has a list of values describing which version of java to use, (8 or 11.)
+The main CI workflow.  Runs on `workflow_call` (from `post-commit.yml` and `ci-with-ratis.yml`) and `workflow_dispatch`.
 
-The jobs currently using the "build matrix" feature are: "compile", "basic", "unit", "acceptance" and "integration".  These jobs also use GA's fail-fast flag to cancel the other jobs in the same matrix, if one fails. For example, in the "compile" job, if the java 8 build fails, the java 11 build will be cancelled due to this flag, but the other jobs outside the "compile" matrix are unaffected. 
+For jobs that use [`check.yml`](./workflows/check.yml), the default runner is `ubuntu-24.04` and only non-default settings are called out below.
 
-While the fail-fast flag only works within a matrix job, the "Cancelling" workflow, (described below,) works across jobs.
+#### build-info
 
+Runs [`dev-support/ci/selective_ci_checks.sh`](../dev-support/ci/selective_ci_checks.sh) on `ubuntu-slim` to determine which of the other jobs are needed based on which files the PR changed.  If triggered by anything other than a PR — or if the PR has a label containing `full tests needed` — every downstream job runs.
 
-#### build-info job
+For each type of check, the script matches the changed files against a regex list to set an output flag.  For example, the kubernetes check uses ([selective_ci_checks.sh lines 279-296](../dev-support/ci/selective_ci_checks.sh)):
 
-[The build-info job script](../dev-support/ci/selective_ci_checks.sh) runs before the others and determines which of the other jobs are to be run.  If the workflow was triggered by some event other than a PR, then all jobs/tests are run.  They are also all run if the PR has a label containing the following string, "full tests needed".
-
-Otherwise, *build-info* first generates a list of files that were changed by the PR.  It matches that list against a series of regex's, each of which is associated with a different job.  It sets the appropriate flag for each match.  Those boolean flags are used later in the run to decide whether the corresponding job should be run
-
-For example, a regex like the following is used to determine if the Kubernetes flag should be set.
 ```
     local pattern_array=(
         "^hadoop-ozone/dev-support/checks/kubernetes.sh"
-        "^hadoop-ozone/dist/src/main/k8s"
+        "^hadoop-ozone/dev-support/checks/install/flekszible.sh"
+        "^hadoop-ozone/dev-support/checks/install/k3s.sh"
+        "^hadoop-ozone/dist"
+    )
+    local ignore_array=(
+        "^hadoop-ozone/dist/src/main/compose"
+        "^hadoop-ozone/dist/src/main/license"
+        "\.md$"
     )
 ```
 
+`build-info` also invokes [`acceptance_suites.sh`](../dev-support/ci/acceptance_suites.sh) and [`integration_suites.sh`](../dev-support/ci/integration_suites.sh) to produce the matrix lists consumed by the `acceptance` and `integration` jobs, and [`categorize_basic_checks.sh`](../dev-support/ci/categorize_basic_checks.sh) for `basic`.
 
+#### build
 
-#### compile job
-[Builds](../hadoop-ozone/dev-support/checks/build.sh) the Java 8 and 11 versions of the jars, and saves the java 8 version for some of the subsequent jobs.
+Runs [`build.sh`](../hadoop-ozone/dev-support/checks/build.sh) at Java 21.  This is the artifact-producing job: on success it uploads three artifacts consumed by downstream jobs — `ozone-bin`, `ozone-src`, and `ozone-repo` (see [`check.yml`](./workflows/check.yml) lines 279-305).  Timeout 60 minutes.
 
-#### basic job
-Runs a subset of the following subjobs depending on what was selected by build-info
-- author: [Verifies](../hadoop-ozone/dev-support/checks/author.sh) none of the Java files contain the @author annotation
-- bats: [Checks](../hadoop-ozone/dev-support/checks/bats.sh) bash scripts, (using the [Bash Automated Testing System](https://github.com/bats-core/bats-core#bats-core-bash-automated-testing-system-2018))
-- checkstyle: [Runs](../hadoop-ozone/dev-support/checks/checkstyle.sh) 'mvn checkstyle' plugin to confirm Java source abides by Ozone coding conventions
-- docs: [Builds](../hadoop-ozone/dev-support/checks/docs.sh) website with [Hugo](https://gohugo.io/)
-- findbugs: [Runs](../hadoop-ozone/dev-support/checks/findbugs.sh) spotbugs static analysis on bytecode
-- pmd: [Runs](../hadoop-ozone/dev-support/checks/pmd.sh) PMD static analysis on project's source code
-- rat (release audit tool): [Confirms](../hadoop-ozone/dev-support/checks/rat.sh) source files include licenses
+#### generate-config-doc / update-ozone-site-config-doc
 
+- `generate-config-doc` (via [`generate-config-doc.yml`](./workflows/generate-config-doc.yml)) extracts the Ozone binary tarball and runs `dev-support/ci/xml_to_md.py` to produce `Configurations.md`.  Runs on PRs and on `master` pushes.
+- `update-ozone-site-config-doc` (via [`update-ozone-site-config-doc.yml`](./workflows/update-ozone-site-config-doc.yml)) opens a PR against `apache/ozone-site` when the generated docs change.  Runs only on `master` pushes in the `apache/ozone` repo.
 
-#### unit job
-Performs unit tests (if necessary) in two parts:
-- unit: [Runs](../hadoop-ozone/dev-support/checks/unit.sh) 'mvn test' for all non integration tests
-- native: [Runs](../hadoop-ozone/dev-support/checks/native.sh) 'mvn test' for all tests that require RocksDB native library to be built (few tests but longer build process)
+#### compile
 
-#### dependency job
-[Confirms](../hadoop-ozone/dev-support/checks/dependency.sh) that the list of jars included in the current build matches the expected ones defined [here](../hadoop-ozone/dist/src/main/license/jar-report.txt)
+Runs [`compile.sh`](../hadoop-ozone/dev-support/checks/compile.sh) across a matrix of Java versions to verify multi-JDK compatibility.  The matrix ([`ci.yml`](./workflows/ci.yml) lines 174-181):
 
-If they don't match, it describes how to make the updates to include the changes, (if they are intentional).  Otherwise, the changes should be removed.
+- Java **8, 11, 17** on `ubuntu-24.04`
+- Java **21** on `macos-15`
 
-#### acceptance job
-[Runs](../hadoop-ozone/dev-support/checks/acceptance.sh) smoketests using robot framework and a real docker compose cluster.  There are three iterations, "secure", "unsecure", and "misc", each running in parallel, as different matrix configs.
+`fail-fast: false`.  The `-Dmaven.compiler.release=${{ matrix.java }}` flag ensures each leg targets its own JDK.  Timeout 45 minutes.
 
-#### kubernetes job
-[Runs](../hadoop-ozone/dev-support/checks/kubernetes.sh) k8s tests
+#### basic
 
-#### integration job
-[Runs](../hadoop-ozone/dev-support/checks/integration.sh) 'mvn test' for all integration/minicluster tests, split into multiple subjobs, by a matrix config.
+Runs one of the following basic checks per matrix leg, selected by `build-info` output ([`ci.yml`](./workflows/ci.yml) lines 197-215).  Runs at Java 21 except for `findbugs`, which is pinned to Java 8 as an [HDDS-10150](https://issues.apache.org/jira/browse/HDDS-10150) workaround (line 204).  `fail-fast: false`.
 
-#### coverage job
-[Merges](../hadoop-ozone/dev-support/checks/coverage.sh) the coverage data from the following jobs that were run earlier:
-- acceptance
-- basic
-- integration
+- author — [`author.sh`](../hadoop-ozone/dev-support/checks/author.sh): confirms no Java source contains `@author`
+- bats — [`bats.sh`](../hadoop-ozone/dev-support/checks/bats.sh): shell tests via [bats-core](https://github.com/bats-core/bats-core)
+- checkstyle — [`checkstyle.sh`](../hadoop-ozone/dev-support/checks/checkstyle.sh): Maven Checkstyle plugin
+- docs — [`docs.sh`](../hadoop-ozone/dev-support/checks/docs.sh): builds the site with [Hugo](https://gohugo.io/)
+- findbugs — [`findbugs.sh`](../hadoop-ozone/dev-support/checks/findbugs.sh): SpotBugs static analysis
+- pmd — [`pmd.sh`](../hadoop-ozone/dev-support/checks/pmd.sh): PMD static analysis
+- rat — [`rat.sh`](../hadoop-ozone/dev-support/checks/rat.sh): Apache RAT license header check
 
-### close-stale-prs Workflow
-[This](./workflows/close-stale-prs.yml) workflow is scheduled each night at midnight and uses the [actions/stale](https://github.com/actions/stale) to automatically manage inactive PRs. It marks PRs as stale after 21 days of inactivity and closes them 7 days later. If a stale PR receives any updates or comments, the stale label is automatically removed.
+#### dependency
 
-## Old/Deprecated Workflows
-The following workflows no longer run but still exist on the [actions](https://github.com/apache/ozone/actions) page for historical reasons:
-- [Build](https://github.com/apache/ozone/actions/workflows/main.yml)
-- [build-branch](https://github.com/apache/ozone/actions/workflows/chaos.yml)
-- [pr-check](https://github.com/apache/ozone/actions/workflows/pr.yml)
+Runs [`dependency.sh`](../hadoop-ozone/dev-support/checks/dependency.sh) against the built tarball to confirm the shipped jars match [`jar-report.txt`](../hadoop-ozone/dist/src/main/license/jar-report.txt).  If they don't, the output describes how to update the report (or which changes to revert).  Timeout 5 minutes.
 
-Note that the deprecated [build-branch](https://github.com/apache/ozone/actions/workflows/chaos.yml) has the same name as the current [build-branch](https://github.com/apache/ozone/actions/workflows/post-commit.yml).  (They can be distinguished by the URL.)
+#### license
 
+Runs [`license.sh`](../hadoop-ozone/dev-support/checks/license.sh) against the built repo to enforce license constraints.  Timeout 15 minutes.
+
+#### javadoc
+
+Runs [`javadoc.sh`](../hadoop-ozone/dev-support/checks/javadoc.sh) against the built repo when compile is needed.  Timeout 30 minutes.
+
+#### repro
+
+Runs [`repro.sh`](../hadoop-ozone/dev-support/checks/repro.sh) to verify the build is reproducible.  On failure runs [`_diffoscope.sh`](../hadoop-ozone/dev-support/checks/_diffoscope.sh) as `post-failure` ([`ci.yml`](./workflows/ci.yml) line 277).  Timeout 30 minutes.
+
+#### acceptance
+
+Runs [`acceptance.sh`](../hadoop-ozone/dev-support/checks/acceptance.sh) (Robot Framework smoketests against a real docker-compose cluster) once per suite, in parallel.  Pinned to **Java 11** because Hadoop may not work with newer JDKs ([`ci.yml`](./workflows/ci.yml) line 294).  `fail-fast: false`.  Timeout 150 minutes.
+
+The suite list is generated dynamically by [`acceptance_suites.sh`](../dev-support/ci/acceptance_suites.sh), which scans `#suite:` markers under `hadoop-ozone/dist/src/main/compose` and excludes the `failing` suite.  Current suites include `balancer`, `cert-rotation`, `compat-new`, `compat-old`, `diskbalancer`, `EC`, `HA-secure`, `HA-unsecure`, `leadership`, `misc`, `MR`, `s3a`, `secure`, `tools`, `unsecure`, and `upgrade`.
+
+#### kubernetes
+
+Runs [`kubernetes.sh`](../hadoop-ozone/dev-support/checks/kubernetes.sh) against the built tarball when Kubernetes-related files changed.  Timeout 60 minutes.
+
+#### integration
+
+Runs [`integration.sh`](../hadoop-ozone/dev-support/checks/integration.sh) with `-Ptest-<profile>` once per profile, in parallel.  Java 21.  `fail-fast: false`.  Timeout 90 minutes.
+
+The profile list is generated by [`integration_suites.sh`](../dev-support/ci/integration_suites.sh) from the `<id>test-*</id>` entries in `pom.xml`.  Current profiles: `client`, `container`, `filesystem`, `flaky`, `hdds`, `om`, `ozone`, `recon`, `snapshot`.
+
+#### coverage
+
+Runs inline (does not use `check.yml`) on `ubuntu-24.04`.  Only runs on `push` events ([`ci.yml`](./workflows/ci.yml) line 356).  Calls [`coverage.sh`](../hadoop-ozone/dev-support/checks/coverage.sh) to merge JaCoCo data, then [`sonar.sh`](../hadoop-ozone/dev-support/checks/sonar.sh) to publish to SonarCloud.  `needs:` `build-info`, `acceptance`, and `integration`.  Timeout 30 minutes.
+
+### close-stale-prs ([close-stale-prs.yaml](./workflows/close-stale-prs.yaml))
+
+Scheduled at `0 0 * * *` (nightly).  Uses [`actions/stale`](https://github.com/actions/stale) to mark PRs stale after 21 days of inactivity and close them 7 days later.  A comment or update removes the stale label.
+
+### pull-request ([pull-request.yml](./workflows/pull-request.yml))
+
+Runs on `pull_request` events `[reopened, opened, edited, synchronize]` on `ubuntu-slim`.  Validates the PR title via [`pr_title_check.sh`](../dev-support/ci/pr_title_check.sh).
+
+### populate-cache / scheduled-cache-update
+
+- [`populate-cache.yml`](./workflows/populate-cache.yml) — populates the shared Maven cache.  Triggers: `push` to release/master branches when a `pom.xml` or the workflow itself changes, plus `workflow_call` and `workflow_dispatch`.  Warms dependencies for both Java 21 (default) and Java 8 (needed by `findbugs` and `compile` matrix leg).
+- [`scheduled-cache-update.yml`](./workflows/scheduled-cache-update.yml) — cron `20 3 * * *`.  Calls `populate-cache.yml` daily.
+
+### zizmor ([zizmor.yml](./workflows/zizmor.yml))
+
+Runs `zizmorcore/zizmor-action` on `ubuntu-latest` for `push` (excluding `dependabot/**`) and `pull_request`.  Static security analysis of the workflow YAML files.
+
+### label-pull-requests / scheduled-label-pull-requests
+
+- [`label-pr.yml`](./workflows/label-pr.yml) — reusable; also supports `workflow_dispatch`.  Adds labels to PRs targeting feature branches based on hard-coded rules.
+- [`schedule-label-pr.yml`](./workflows/schedule-label-pr.yml) — cron `*/5 * * * *`.  Calls `label-pr.yml`.
+
+### Developer utility workflows (manual `workflow_dispatch` only)
+
+- **flaky-test-check** ([`intermittent-test-check.yml`](./workflows/intermittent-test-check.yml)) — repeatedly runs a specific test class across parallel splits to surface flakiness.  Defaults to 10 splits × 10 iterations at Java 21.  Can optionally build against a custom Ratis ref via [`build-ratis.yml`](./workflows/build-ratis.yml).
+- **repeat-acceptance-test** ([`repeat-acceptance.yml`](./workflows/repeat-acceptance.yml)) — repeats one acceptance suite (or a filter regex) across parallel splits.  Uses Java 8.
+- **ci-with-ratis** ([`ci-with-ratis.yml`](./workflows/ci-with-ratis.yml)) — runs the full-ci workflow against a custom Ratis build.  Calls `build-ratis.yml` first, then `ci.yml` with the resulting version overrides in `ratis_args`.
+
+### Reusable internal workflows (`workflow_call` only)
+
+- [`check.yml`](./workflows/check.yml) — the harness that runs a single check script from `hadoop-ozone/dev-support/checks/`.  Handles checkout, Maven and NPM cache restore, artifact download (source tarball, binary tarball, Ozone repo, Ratis jars), Java setup, pre/post scripts, script execution, artifact upload, and failure summary.  Almost every job in `ci.yml` uses this.  Default runner is `ubuntu-24.04`.  Container image env vars live at lines 138-143 (`ghcr.io/apache/hadoop`, `ghcr.io/apache/ozone`, `ghcr.io/apache/ozone-runner`).
+- [`build-ratis.yml`](./workflows/build-ratis.yml) — builds a custom Ratis snapshot at Java 8, uploads it as the `ratis-jars` artifact, and emits version-override args for the calling workflow.
+- [`generate-config-doc.yml`](./workflows/generate-config-doc.yml) and [`update-ozone-site-config-doc.yml`](./workflows/update-ozone-site-config-doc.yml) — invoked directly as jobs from `ci.yml`, described above.
+
+## Old / Deprecated Workflows
+
+The workflows `main.yml` (Build), `chaos.yml` (former `build-branch`), and `pr.yml` (pr-check) were removed from this repository.  Their files no longer exist under [`.github/workflows/`](./workflows).  They are mentioned here only so readers who arrive from historical GitHub Actions run URLs on the [apache/ozone actions page](https://github.com/apache/ozone/actions) have some context for what those workflows used to be.
 
 ## Tips
 
 - When a build of the Ozone master branch fails, its artifacts are stored [here](https://elek.github.io/ozone-build-results/).
-- To trigger rerunning the tests, push a commit like this to your PR: ```git commit --allow-empty -m 'trigger new CI check'```
+- To trigger rerunning the tests, push an empty commit to your PR: `git commit --allow-empty -m 'trigger new CI check'`.
 - [This wiki](https://cwiki.apache.org/confluence/display/OZONE/Running+Ozone+Smoke+Tests+and+Unit+Tests) contains tips on running tests locally.
-- [This wiki](https://cwiki.apache.org/confluence/display/OZONE/Github+Actions+tips+and+tricks) contains tips on special handling of the CI system, such as "Executing one test multiple times", or "ssh'ing in to the CI machine while the tests are running".
+- [This wiki](https://cwiki.apache.org/confluence/display/OZONE/Github+Actions+tips+and+tricks) contains tips on special handling of the CI system, such as executing one test multiple times or SSHing into the CI machine while tests are running.

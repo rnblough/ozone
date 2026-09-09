@@ -54,7 +54,7 @@ if [[ -f hadoop-ozone/dist/src/shell/ozone/ozone-functions.sh ]]; then
   ozone_java_setup
 fi
 
-mvn ${MAVEN_OPTIONS} clean
+# mvn ${MAVEN_OPTIONS} clean
 
 if [[ ${ITERATIONS} -gt 1 ]] && [[ ${OZONE_REPO_CACHED} == "false" ]]; then
   mvn ${MAVEN_OPTIONS} -DskipTests install
