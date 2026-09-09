@@ -117,7 +117,7 @@ The CI pipeline layers several parallelism mechanisms, some effective and some d
 
 ### Maven reactor parallelism (`-T 1C`)
 
-`-T 1C` runs one Maven builder thread per available core across the *reactor* — it parallelizes module builds, not Surefire forks within a single module.  It was added recently to nearly every check script.  For per-module goals it works; for aggregator goals that execute once at the reactor root it is a no-op.
+`-T 1C` runs one Maven builder thread per available core across the *reactor* — it parallelizes module builds, not Surefire forks within a single module.  For per-module goals it works; for aggregator goals that execute once at the reactor root it is a no-op, and for the CI `integration` job it is actively unsafe (see [Removed sites](#removed--t-1c-sites) below).
 
 | Script | Line | Goal | Effective? |
 |---|---|---|---|
@@ -126,12 +126,15 @@ The CI pipeline layers several parallelism mechanisms, some effective and some d
 | [`pmd.sh`](../hadoop-ozone/dev-support/checks/pmd.sh) | 29 | `pmd:check` | Yes |
 | [`findbugs.sh`](../hadoop-ozone/dev-support/checks/findbugs.sh) | 33 | `spotbugs:check` | Yes |
 | [`rat.sh`](../hadoop-ozone/dev-support/checks/rat.sh) | 27 | `apache-rat-plugin:check` | Yes |
-| [`javadoc.sh`](../hadoop-ozone/dev-support/checks/javadoc.sh) | 26 | `javadoc:aggregate` | **No** — aggregator goal runs once at the reactor root; `-T` cannot split it |
-| [`license.sh`](../hadoop-ozone/dev-support/checks/license.sh) | 45 | `license:aggregate-add-third-party` | **No** — same reason as `javadoc:aggregate` |
-| [`junit.sh`](../hadoop-ozone/dev-support/checks/junit.sh) | 38 | `verify` (used by the `integration` job via [`integration.sh`](../hadoop-ozone/dev-support/checks/integration.sh)) | Runs, but with a caveat — see below |
 | [`populate-cache.yml`](./workflows/populate-cache.yml) | 38, 100 | `-Pgo-offline clean verify` and Java 8 `test-compile` | Yes |
 
-The `-T 1C` on `junit.sh` runs multiple modules' Surefire executions concurrently, one per builder thread.  Because the CI `integration` job does not restrict the reactor (`ci.yml` line 344 passes only `-Ptest-<profile> -Drocks_tools_native`), several modules can execute Surefire in parallel.  Each individual Surefire still uses the default `forkCount=1` because the [`parallel-tests` profile](#dormant-knobs) that would apply per-fork isolation is not activated.  `MiniOzoneCluster` (which binds fixed default ports and shares `test.build.data` when isolation is off) can therefore run in more than one JVM at once with no coordination.  The flag is not broken — Maven does start parallel builders — but the isolation contract that would make cluster-based tests safe under it is not in effect.
+#### Removed `-T 1C` sites
+
+`-T 1C` was previously also present in three scripts where it was either a no-op or unsafe; it has been removed:
+
+- [`javadoc.sh`](../hadoop-ozone/dev-support/checks/javadoc.sh) — invokes `javadoc:aggregate`, an aggregator goal that binds to the reactor root and runs once.  `-T` cannot split it.
+- [`license.sh`](../hadoop-ozone/dev-support/checks/license.sh) — invokes `license:aggregate-add-third-party` — same reason as `javadoc:aggregate`.
+- [`junit.sh`](../hadoop-ozone/dev-support/checks/junit.sh) — used by the `integration` job via [`integration.sh`](../hadoop-ozone/dev-support/checks/integration.sh).  The CI `integration` job does not restrict the reactor (`ci.yml` line 344 passes only `-Ptest-<profile> -Drocks_tools_native`), so `-T 1C` caused several modules to execute Surefire concurrently, one per builder thread.  Each Surefire still used the default `forkCount=1` because the [`parallel-tests` profile](#dormant-knobs) that would apply per-fork isolation is not activated.  `MiniOzoneCluster` (which binds fixed default ports and shares `test.build.data` when isolation is off) could therefore run in more than one JVM at once with no coordination — a source of intermittent port-bind / stale-state failures.  Re-introducing intra-module parallelism should go through the `parallel-tests` profile instead (see [Dormant knobs](#dormant-knobs)).
 
 ### Surefire and JVM knobs (working)
 
